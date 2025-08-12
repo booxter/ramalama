@@ -1,8 +1,13 @@
 import unittest
 from argparse import Namespace
+from http.client import HTTPException
+from json import JSONDecodeError
+from subprocess import TimeoutExpired
 from unittest.mock import patch
 
-from ramalama.engine import Engine, containers, dry_run, images
+import pytest
+
+from ramalama.engine import Engine, containers, dry_run, images, wait_for_healthy
 
 
 class TestEngine(unittest.TestCase):
@@ -101,6 +106,62 @@ class TestEngine(unittest.TestCase):
         with patch('sys.stdout') as mock_stdout:
             dry_run(["podman", "run", "--rm", "test-image"])
             mock_stdout.write.assert_called()
+
+
+@pytest.mark.parametrize(
+    "status, body, msg",
+    [
+        (500, "", "status code 500"),
+        (200, "{}", "does not include model list"),
+        (200, '{"models": []}', 'does not include "themodel"'),
+        (200, '{"models": [{"name": "somemodel"}]}', 'does not include "themodel"'),
+    ],
+)
+@patch("ramalama.engine.time.sleep", side_effect=TimeoutExpired("sleep", 1))
+@patch("ramalama.engine.logger.debug")
+@patch("ramalama.engine.HTTPConnection")
+def test_wait_for_healthy_fail(mock_conn, mock_debug, mock_sleep, status, body, msg):
+    mock_resp = mock_conn.return_value.getresponse.return_value
+    mock_resp.status = status
+    mock_resp.read.return_value = body
+    args = Namespace(MODEL="themodel", name="thecontainer", port=8080, debug=False)
+    with pytest.raises(TimeoutExpired):
+        wait_for_healthy(args, timeout=1)
+    assert msg in mock_debug.call_args.args[0]
+
+
+@pytest.mark.parametrize(
+    "exc, msg",
+    [(ConnectionError("conn"), "conn"), (HTTPException("http"), "http"), (JSONDecodeError("json", "resp", 0), "json")],
+)
+@patch("ramalama.engine.time.sleep", side_effect=TimeoutExpired("sleep", 1))
+@patch("ramalama.engine.logger.debug")
+@patch("ramalama.engine.HTTPConnection")
+def test_wait_for_healthy_error(mock_conn, mock_debug, mock_sleep, exc, msg):
+    mock_conn.side_effect = exc
+    args = Namespace(name="thecontainer", port=8080)
+    with pytest.raises(TimeoutExpired):
+        wait_for_healthy(args, timeout=1)
+    assert f"failed, retrying... Error: {msg}" in mock_debug.call_args.args[0]
+
+
+@patch("ramalama.engine.logs", return_value="container logs...")
+def test_wait_for_healthy_timeout(mock_logs):
+    args = Namespace(name="thecontainer", debug=False)
+    with pytest.raises(TimeoutExpired, match="timed out after 0 seconds") as exc_info:
+        wait_for_healthy(args, timeout=0)
+    assert exc_info.value.output == mock_logs.return_value
+
+
+@patch("ramalama.engine.logger.debug")
+@patch("ramalama.engine.HTTPConnection")
+def test_wait_for_healthy_success(mock_conn, mock_debug):
+    mock_resp = mock_conn.return_value.getresponse.return_value
+    mock_resp.status = 200
+    mock_resp.read.return_value = '{"models": [{"name": "themodel"}]}'
+    args = Namespace(MODEL="themodel", name="thecontainer", port=8080, debug=False)
+    wait_for_healthy(args, timeout=1)
+    assert mock_debug.call_args.args[0] == "Container thecontainer is healthy"
 
 
 if __name__ == '__main__':
